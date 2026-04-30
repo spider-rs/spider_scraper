@@ -1,4 +1,4 @@
-use fast_html5ever::Namespace;
+use html5ever::Namespace;
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::matching;
 use selectors::{Element, OpaqueElement};

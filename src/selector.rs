@@ -3,7 +3,7 @@
 use crate::element_ref::ElementRef;
 use crate::error::SelectorErrorKind;
 use cssparser::ToCss;
-use fast_html5ever::{LocalName, Namespace};
+use html5ever::{LocalName, Namespace};
 use selectors::parser::SelectorParseErrorKind;
 use selectors::{matching, parser, NthIndexCache};
 use smallvec::SmallVec;

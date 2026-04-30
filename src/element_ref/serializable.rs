@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use fast_html5ever::serialize::{Serialize, Serializer, TraversalScope};
+use html5ever::serialize::{Serialize, Serializer, TraversalScope};
 
 use super::ElementRef;
 

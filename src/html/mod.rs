@@ -2,15 +2,17 @@
 
 use ego_tree::iter::Nodes;
 use ego_tree::{NodeId, Tree};
-use fast_html5ever::serialize::SerializeOpts;
-use fast_html5ever::tree_builder::QuirksMode;
-use fast_html5ever::QualName;
-use fast_html5ever::{driver, serialize};
+use html5ever::serialize::SerializeOpts;
+use html5ever::tree_builder::QuirksMode;
+use html5ever::QualName;
+use html5ever::{driver, serialize};
 use tendril::TendrilSink;
 
 use crate::element_ref::ElementRef;
 use crate::node::Node;
 use crate::selector::Selector;
+
+use self::tree_sink::HtmlBuilder;
 
 lazy_static! {
     static ref HTML_SELECTOR: Selector = Selector::parse("html").unwrap();
@@ -21,7 +23,7 @@ lazy_static! {
 /// Parsing does not fail hard. Instead, the `quirks_mode` is set and errors are added to the
 /// `errors` field. The `tree` will still be populated as best as possible.
 ///
-/// Implements the `TreeSink` trait from the `fast_html5ever` crate, which allows HTML to be parsed.
+/// Implements the `TreeSink` trait from the `html5ever` crate, which allows HTML to be parsed.
 #[derive(Debug, Clone)]
 pub struct Html {
     /// The quirks mode.
@@ -56,11 +58,11 @@ impl Html {
     /// This is a convenience method for the following:
     ///
     /// ```
-    /// # extern crate fast_html5ever;
+    /// # extern crate html5ever;
     /// # extern crate tendril;
     /// # fn main() {
     /// # let document = "";
-    /// use fast_html5ever::driver::{self, ParseOpts};
+    /// use html5ever::driver::{self, ParseOpts};
     /// use scraper::Html;
     /// use tendril::TendrilSink;
     ///
@@ -69,17 +71,18 @@ impl Html {
     /// # }
     /// ```
     pub fn parse_document(document: &str) -> Self {
-        let parser = driver::parse_document(Self::new_document(), Default::default());
+        let parser = driver::parse_document(HtmlBuilder::new_document(), Default::default());
         parser.one(document)
     }
 
     /// Parses a string of HTML as a fragment.
     pub fn parse_fragment(fragment: &str) -> Self {
         let parser = driver::parse_fragment(
-            Self::new_fragment(),
+            HtmlBuilder::new_fragment(),
             Default::default(),
             QualName::new(None, ns!(html), local_name!("body")),
             Vec::new(),
+            false,
         );
         parser.one(fragment)
     }
@@ -126,7 +129,7 @@ impl Html {
     pub fn html(&self) -> String {
         let opts = SerializeOpts {
             scripting_enabled: false, // It's not clear what this does.
-            traversal_scope: fast_html5ever::serialize::TraversalScope::IncludeNode,
+            traversal_scope: html5ever::serialize::TraversalScope::IncludeNode,
             create_missing_parent: false,
         };
         let mut buf = Vec::new();
@@ -184,6 +187,22 @@ mod tree_sink;
 mod tests {
     use super::Html;
     use super::Selector;
+
+    /// Compile-time assertion that the parsed `Html` is `Send`.
+    /// This is the whole point of the spider-html5ever / spider-tendril
+    /// fork swap — `Html` (and the futures that hold it) can now move
+    /// across thread boundaries on a multi-threaded async runtime.
+    ///
+    /// `Sync` is NOT asserted: `Tendril` contains a `Cell<NonZeroUsize>`
+    /// pointer field that is intentionally `!Sync`. Spider_scraper owns
+    /// its tree directly (no `Arc`), so `Send` is the only bound we need
+    /// for cross-thread movement.
+    #[test]
+    fn parsed_html_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let html = Html::parse_document("<p>hi</p>");
+        assert_send(&html);
+    }
 
     #[test]
     fn root_element_fragment() {

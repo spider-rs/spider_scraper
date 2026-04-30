@@ -1,79 +1,162 @@
 use super::Html;
 use crate::node::{Doctype, Element, Node, ProcessingInstruction, Text};
-use ego_tree::NodeId;
-use fast_html5ever::tendril::StrTendril;
-use fast_html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use fast_html5ever::Attribute;
-use fast_html5ever::{ExpandedName, QualName};
+use ego_tree::{NodeId, Tree};
+use html5ever::interface::ElemName;
+use html5ever::tendril::StrTendril;
+use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::Attribute;
+use html5ever::QualName;
+use html5ever::{LocalName, Namespace};
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 
-/// Note: does not support the `<template>` element.
-impl TreeSink for Html {
-    type Output = Self;
+/// Owned `ElemName` implementation.
+///
+/// `html5ever` 0.39's `TreeSink::ElemName<'a>` requires the returned name
+/// to outlive the borrow of `self`. We can't return a reference into the
+/// `RefCell<Tree>` because the `Ref` guard would die at function return.
+/// Cloning the cheap, `Arc`-backed `Namespace` and `LocalName` atoms
+/// sidesteps the lifetime/aliasing problem with no `unsafe`.
+#[derive(Debug)]
+pub(crate) struct OwnedElemName {
+    ns: Namespace,
+    local: LocalName,
+}
+
+impl ElemName for OwnedElemName {
+    fn ns(&self) -> &Namespace {
+        &self.ns
+    }
+
+    fn local_name(&self) -> &LocalName {
+        &self.local
+    }
+}
+
+impl OwnedElemName {
+    /// Sentinel used when the parser asks for `elem_name` of a node that
+    /// somehow isn't an element. Should never happen under the parser's
+    /// invariants, but we'd rather return a placeholder than panic.
+    fn sentinel() -> Self {
+        OwnedElemName {
+            ns: Namespace::default(),
+            local: LocalName::default(),
+        }
+    }
+}
+
+/// Internal builder used during parsing.
+///
+/// `html5ever` 0.39's `TreeSink` callbacks take `&self`, so the builder
+/// uses interior mutability via `RefCell<Tree<Node>>`. After parsing
+/// finishes, we collapse it into a plain `Html` so the public API stays
+/// borrow-friendly (no `RefCell` on `Html` itself, no API churn for
+/// `select` / `root_element` / `ElementRef`).
+///
+/// Every `TreeSink` callback that touches the tree is defensive: an
+/// invalid `NodeId` from the parser is silently ignored rather than
+/// triggering an `unwrap()` panic. Under the parser's invariants this
+/// never fires; the defensiveness exists to keep us crash-free even if
+/// upstream html5ever ever produces an unexpected handle.
+#[derive(Debug)]
+pub(crate) struct HtmlBuilder {
+    quirks_mode: Cell<QuirksMode>,
+    tree: RefCell<Tree<Node>>,
+}
+
+impl HtmlBuilder {
+    pub(crate) fn new_document() -> Self {
+        HtmlBuilder {
+            quirks_mode: Cell::new(QuirksMode::NoQuirks),
+            tree: RefCell::new(Tree::new(Node::Document)),
+        }
+    }
+
+    pub(crate) fn new_fragment() -> Self {
+        HtmlBuilder {
+            quirks_mode: Cell::new(QuirksMode::NoQuirks),
+            tree: RefCell::new(Tree::new(Node::Fragment)),
+        }
+    }
+}
+
+impl TreeSink for HtmlBuilder {
+    type Output = Html;
     type Handle = NodeId;
+    type ElemName<'a>
+        = OwnedElemName
+    where
+        Self: 'a;
 
-    fn finish(self) -> Self {
-        self
+    fn finish(self) -> Html {
+        Html {
+            quirks_mode: self.quirks_mode.into_inner(),
+            tree: self.tree.into_inner(),
+            lang: String::new(),
+        }
     }
 
-    // Signal a parse error.
-    fn parse_error(&mut self, _: Cow<'static, str>) {}
+    fn parse_error(&self, _: Cow<'static, str>) {}
 
-    // Set the document's quirks mode.
-    fn set_quirks_mode(&mut self, mode: QuirksMode) {
-        self.quirks_mode = mode;
+    fn set_quirks_mode(&self, mode: QuirksMode) {
+        self.quirks_mode.set(mode);
     }
 
-    // Get a handle to the Document node.
-    fn get_document(&mut self) -> Self::Handle {
-        self.tree.root().id()
+    fn get_document(&self) -> Self::Handle {
+        self.tree.borrow().root().id()
     }
 
-    // Do two handles refer to the same node?
     fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
         x == y
     }
 
-    // What is the name of this element?
-    //
-    // Should never be called on a non-element node; feel free to panic!.
-    fn elem_name(&self, target: &Self::Handle) -> ExpandedName {
-        self.tree
-            .get(*target)
-            .unwrap()
-            .value()
-            .as_element()
-            .unwrap()
-            .name
-            .expanded()
+    fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> OwnedElemName {
+        let tree = self.tree.borrow();
+        let Some(node) = tree.get(*target) else {
+            return OwnedElemName::sentinel();
+        };
+        let Some(elem) = node.value().as_element() else {
+            return OwnedElemName::sentinel();
+        };
+        OwnedElemName {
+            ns: elem.name.ns.clone(),
+            local: elem.name.local.clone(),
+        }
     }
 
-    // Create an element.
-    //
-    // When creating a template element (name.ns.expanded() == expanded_name!(html "template")), an
-    // associated document fragment called the "template contents" should also be created. Later
-    // calls to self.get_template_contents() with that given element return it.
     fn create_element(
-        &mut self,
+        &self,
         name: QualName,
         attrs: Vec<Attribute>,
         _flags: ElementFlags,
     ) -> Self::Handle {
-        let mut node = self
-            .tree
-            .orphan(Node::Element(Element::new(name.clone(), attrs)));
+        let mut tree = self.tree.borrow_mut();
+        let mut node = tree.orphan(Node::Element(Element::new(name.clone(), attrs)));
         if name.expanded() == expanded_name!(html "template") {
             node.append(Node::Fragment);
         }
         node.id()
     }
 
-    // Create a comment node. todo: remove from tree sink
-    fn create_comment(&mut self, _: StrTendril) {}
+    fn create_comment(&self, _text: StrTendril) -> Self::Handle {
+        // Comments are dropped (matches the previous fast_html5ever sink).
+        // We still need to return a Handle — make an orphan Fragment that
+        // gets garbage-collected with the rest of the tree on drop.
+        self.tree.borrow_mut().orphan(Node::Fragment).id()
+    }
 
-    // Append a DOCTYPE element to the Document node.
+    fn create_pi(&self, target: StrTendril, data: StrTendril) -> Self::Handle {
+        self.tree
+            .borrow_mut()
+            .orphan(Node::ProcessingInstruction(ProcessingInstruction {
+                target: target.into_send().into(),
+                data: data.into_send().into(),
+            }))
+            .id()
+    }
+
     fn append_doctype_to_document(
-        &mut self,
+        &self,
         name: StrTendril,
         public_id: StrTendril,
         system_id: StrTendril,
@@ -83,106 +166,125 @@ impl TreeSink for Html {
             public_id: public_id.into_send().into(),
             system_id: system_id.into_send().into(),
         };
-        self.tree.root_mut().append(Node::Doctype(doctype));
+        self.tree
+            .borrow_mut()
+            .root_mut()
+            .append(Node::Doctype(doctype));
     }
 
-    // Append a node as the last child of the given node. If this would produce adjacent sibling
-    // text nodes, it should concatenate the text instead.
-    //
-    // The child node will not already have a parent.
-    fn append(&mut self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
-        let mut parent = self.tree.get_mut(*parent).unwrap();
+    fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
+        let mut tree = self.tree.borrow_mut();
+        let Some(mut parent_node) = tree.get_mut(*parent) else {
+            return;
+        };
 
         match child {
             NodeOrText::AppendNode(id) => {
-                parent.append_id(id);
+                parent_node.append_id(id);
             }
 
             NodeOrText::AppendText(text) => {
-                let can_concat = parent
+                let can_concat = parent_node
                     .last_child()
                     .map_or(false, |mut n| n.value().is_text());
 
                 let text = text.into_send().into();
 
                 if can_concat {
-                    let mut last_child = parent.last_child().unwrap();
-                    match *last_child.value() {
-                        Node::Text(ref mut t) => t.text.push_tendril(&text),
-                        _ => unreachable!(),
+                    if let Some(mut last_child) = parent_node.last_child() {
+                        if let Node::Text(ref mut t) = *last_child.value() {
+                            t.text.push_tendril(&text);
+                            return;
+                        }
                     }
-                } else {
-                    parent.append(Node::Text(Text { text }));
                 }
+                parent_node.append(Node::Text(Text { text }));
             }
         }
     }
 
-    // Append a node as the sibling immediately before the given node. If that node has no parent,
-    // do nothing and return Err(new_node).
-    //
-    // The tree builder promises that sibling is not a text node. However its old previous sibling,
-    // which would become the new node's previous sibling, could be a text node. If the new node is
-    // also a text node, the two should be merged, as in the behavior of append.
-    //
-    // NB: new_node may have an old parent, from which it should be removed.
     fn append_before_sibling(
-        &mut self,
+        &self,
         sibling: &Self::Handle,
         new_node: NodeOrText<Self::Handle>,
     ) {
+        let mut tree = self.tree.borrow_mut();
+
         if let NodeOrText::AppendNode(id) = new_node {
-            self.tree.get_mut(id).unwrap().detach();
+            if let Some(mut node) = tree.get_mut(id) {
+                node.detach();
+            }
         }
 
-        let mut sibling = self.tree.get_mut(*sibling).unwrap();
-        if sibling.parent().is_some() {
-            match new_node {
-                NodeOrText::AppendNode(id) => {
-                    sibling.insert_id_before(id);
-                }
+        let Some(mut sibling_node) = tree.get_mut(*sibling) else {
+            return;
+        };
+        if sibling_node.parent().is_none() {
+            return;
+        }
 
-                NodeOrText::AppendText(text) => {
-                    let text = text.into_send().into();
-                    let can_concat = sibling
-                        .prev_sibling()
-                        .map_or(false, |mut n| n.value().is_text());
+        match new_node {
+            NodeOrText::AppendNode(id) => {
+                sibling_node.insert_id_before(id);
+            }
+            NodeOrText::AppendText(text) => {
+                let text = text.into_send().into();
+                let can_concat = sibling_node
+                    .prev_sibling()
+                    .map_or(false, |mut n| n.value().is_text());
 
-                    if can_concat {
-                        let mut prev_sibling = sibling.prev_sibling().unwrap();
-                        match *prev_sibling.value() {
-                            Node::Text(ref mut t) => t.text.push_tendril(&text),
-                            _ => unreachable!(),
+                if can_concat {
+                    if let Some(mut prev_sibling) = sibling_node.prev_sibling() {
+                        if let Node::Text(ref mut t) = *prev_sibling.value() {
+                            t.text.push_tendril(&text);
+                            return;
                         }
-                    } else {
-                        sibling.insert_before(Node::Text(Text { text }));
                     }
                 }
+                sibling_node.insert_before(Node::Text(Text { text }));
             }
         }
     }
 
-    // Detach the given node from its parent.
-    fn remove_from_parent(&mut self, target: &Self::Handle) {
-        if let Some(mut p) = self.tree.get_mut(*target) {
+    fn append_based_on_parent_node(
+        &self,
+        element: &Self::Handle,
+        prev_element: &Self::Handle,
+        child: NodeOrText<Self::Handle>,
+    ) {
+        let has_parent = self
+            .tree
+            .borrow()
+            .get(*element)
+            .and_then(|n| n.parent())
+            .is_some();
+        if has_parent {
+            self.append_before_sibling(element, child)
+        } else {
+            self.append(prev_element, child)
+        }
+    }
+
+    fn remove_from_parent(&self, target: &Self::Handle) {
+        if let Some(mut p) = self.tree.borrow_mut().get_mut(*target) {
             p.detach();
         }
     }
 
-    // Remove all the children from node and append them to new_parent.
-    fn reparent_children(&mut self, node: &Self::Handle, new_parent: &Self::Handle) {
-        if let Some(mut p) = self.tree.get_mut(*new_parent) {
+    fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
+        if let Some(mut p) = self.tree.borrow_mut().get_mut(*new_parent) {
             p.reparent_from_id_append(*node);
         }
     }
 
-    // Add each attribute to the given element, if no attribute with that name already exists. The
-    // tree builder promises this will never be called with something else than an element.
-    fn add_attrs_if_missing(&mut self, target: &Self::Handle, attrs: Vec<Attribute>) {
-        let mut node = self.tree.get_mut(*target).unwrap();
+    fn add_attrs_if_missing(&self, target: &Self::Handle, attrs: Vec<Attribute>) {
+        let mut tree = self.tree.borrow_mut();
+        let Some(mut node) = tree.get_mut(*target) else {
+            return;
+        };
         let element = match *node.value() {
             Node::Element(ref mut e) => e,
-            _ => unreachable!(),
+            _ => return,
         };
 
         for attr in attrs {
@@ -193,37 +295,14 @@ impl TreeSink for Html {
         }
     }
 
-    // Get a handle to a template's template contents.
-    //
-    // The tree builder promises this will never be called with something else than a template
-    // element.
-    fn get_template_contents(&mut self, target: &Self::Handle) -> Self::Handle {
-        self.tree.get(*target).unwrap().first_child().unwrap().id()
-    }
-
-    // Mark a HTML <script> element as "already started".
-    fn mark_script_already_started(&mut self, _node: &Self::Handle) {}
-
-    // Create Processing Instruction.
-    fn create_pi(&mut self, target: StrTendril, data: StrTendril) -> Self::Handle {
-        self.tree
-            .orphan(Node::ProcessingInstruction(ProcessingInstruction {
-                target: target.into_send().into(),
-                data: data.into_send().into(),
-            }))
-            .id()
-    }
-
-    fn append_based_on_parent_node(
-        &mut self,
-        element: &Self::Handle,
-        prev_element: &Self::Handle,
-        child: NodeOrText<Self::Handle>,
-    ) {
-        if self.tree.get(*element).unwrap().parent().is_some() {
-            self.append_before_sibling(element, child)
-        } else {
-            self.append(prev_element, child)
-        }
+    fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
+        let tree = self.tree.borrow();
+        // Defensive: fall back to the document root if the parser hands
+        // us a non-template handle. Should never happen under the parser
+        // invariants but we'd rather degrade than panic.
+        tree.get(*target)
+            .and_then(|n| n.first_child())
+            .map(|c| c.id())
+            .unwrap_or_else(|| tree.root().id())
     }
 }

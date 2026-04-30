@@ -1,6 +1,6 @@
 [package]
 name = "spider_scraper"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "A css scraper using html5ever"
 license = "MIT"
@@ -13,9 +13,10 @@ name = "scraper"
 
 [dependencies]
 lazy_static = "1"
-fast_html5ever = "0.26.6"
+html5ever = { version = "0.39", package = "spider-html5ever" }
+markup5ever = { version = "0.39", package = "spider-markup5ever" }
 selectors = "0.25.0"
-tendril = "0.4.3"
+tendril = { version = "0.5", package = "spider-tendril" }
 ahash = { version = "0.8", default-features = false, features = ["std"] }
 cssparser = "0.31.2"
 smallvec = "1"
