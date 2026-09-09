@@ -55,20 +55,11 @@ impl Html {
 
     /// Parses a string of HTML as a document.
     ///
-    /// This is a convenience method for the following:
-    ///
     /// ```
-    /// # extern crate html5ever;
-    /// # extern crate tendril;
-    /// # fn main() {
-    /// # let document = "";
-    /// use html5ever::driver::{self, ParseOpts};
     /// use scraper::Html;
-    /// use tendril::TendrilSink;
     ///
-    /// let parser = driver::parse_document(Html::new_document(), ParseOpts::default());
-    /// let html = parser.one(document);
-    /// # }
+    /// let html = Html::parse_document("<p>hello</p>");
+    /// assert_eq!(html.root_element().html().is_empty(), false);
     /// ```
     pub fn parse_document(document: &str) -> Self {
         let parser = driver::parse_document(HtmlBuilder::new_document(), Default::default());
